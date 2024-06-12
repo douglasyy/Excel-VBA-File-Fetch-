@@ -1,0 +1,171 @@
+Sub SaveFile_Monthly_Treasury_1()
+    Dim ol As Outlook.Application
+    Dim ns As Outlook.Namespace
+    Dim fol As Outlook.Folder
+    Dim mainFolder As MAPIFolder
+    Dim SubFolder As MAPIFolder
+    Dim mi As Outlook.MailItem
+    Dim fso As Object
+    Dim fiscalYearFolder As String
+    Dim monthFolder As String
+    Dim today As Date
+    Dim startDate As Date
+    Dim endDate As Date
+    Dim attachmentCount As Integer
+    Dim saveName As String
+    Dim wb As Workbook
+        Set wb = ThisWorkbook
+    Dim ws As Worksheet
+        Set ws = wb.Sheets("Files Drop VBA")
+    Dim Atmt As attachment
+    'Dim fiscalYearStartMonth As Integer'
+    Dim fiscalMonthNumber As Integer
+    
+    'Declare the variables for timing'
+    Dim startTime As Date
+    Dim endTime As Date
+    Dim processTime As Double
+    Dim dtFirstBusinessDay As Date
+    
+    
+    '!!!Declare the values need to be specfied for this cell
+    Dim currentRow As Integer
+        currentRow = 2
+        
+    'Following are parameters, which can be
+    Dim titleCol As Integer
+        titleCol = 2
+    Dim namesCol As Integer
+    'The Start Col number of putting file names
+        namesCol = 9
+    'The Col number of putting attachment count
+    Dim fileCountCol As Integer
+        fileCountCol = 7
+    
+    
+    startTime = Now
+    
+    
+    fiscalYearStartMonth = 11 'November, maybe I would set this parameter in worksheet'
+    
+    today = Date
+    startDate = DateSerial(Year(today), Month(today), 1)
+    
+    endDate = today
+    
+    'Specify the folder we want to save the attachment files'
+    saveFolder = "\\Wmmcc-fn-00002b.ad.cibc.com\dcm_ds_gcm\LIQUIDTY\LIQUIDITY MANAGEMENT GROUP\Production Report\FR2052a\"
+    
+    ' Calculate the timestamp for the previous month'
+    previousMonth = DateAdd("m", -1, today)
+    
+    ' Determine fiscal year'
+    If Month(previousMonth) >= fiscalYearStartMonth Then
+        fiscalYearFolder = "FY" & Right(Year(today) + 1, 2) & "\"
+        fiscalMonthNumber = (Month(previousMonth) - fiscalYearStartMonth) Mod 12 + 1
+    Else
+        fiscalYearFolder = "FY" & Right(Year(today), 2) & "\"
+        fiscalMonthNumber = (Month(previousMonth) - fiscalYearStartMonth + 12) Mod 12 + 1
+    End If
+    
+    
+    
+    ' Define the folder name for the previous month'
+    monthFolder = fiscalMonthNumber & ". FR2052a_" & Format(previousMonth, "mmmm yy") & "\"
+    dropFolder = saveFolder & fiscalYearFolder & monthFolder & "CIBC Bank USA\" & "Files from Chicago\"
+    
+    If Dir(dropFolder, vbDirectory) = "" Then
+        MkDir dropFolder
+    End If
+        
+    
+    'Another Place for US Automation Purpose'
+    
+    H_SaveFolder = "H:\FR 2052a\2052a Controls\US MA Automation\Input Files\Auto Drop\"
+    
+    'Initiate the Outlook Items for development'
+    Set ol = New Outlook.Application
+    Set ns = ol.GetNamespace("MAPI")
+    
+    'To make it more universal, I can just use the mainfolder / inbox directly'
+    Set mainFolder = ns.GetDefaultFolder(olFolderInbox)
+    'I changed from 2052a MA related to whole Inbox, need to test if this would exceed longest time allowed'
+    Set SubFolder = mainFolder.Folders("2052a MA related")
+    
+    Set mitems = SubFolder.Items
+        mitems.Sort "ReceivedTime", True
+    
+    previousMonth = DateAdd("m", -1, today)
+    attachmentCount = 0
+    
+    Debug.Print "Monthly Deliverbales for Treasury - " & Format(previousMonth, "mmmm yyyy")
+    ' The first day and first business day
+    firstDayofMonth = DateSerial(Year(Date), Month(Date), 1)
+    
+    dtFirstBusinessDay = dtFirstDay
+    Select Case Weekday(dtFirstBusinessDay)
+        Case vbSaturday
+            dtFirstBusinessDay = dtFirstBusinessDay + 2
+        Case vbSunday
+            dtFirstBusinessDay = dtFirstBusinessDay + 1
+    End Select
+
+    
+    
+    'Loop through the emails in
+    For Each mi In mitems
+        'Only check the emails received on the first day'
+        Debug.Print mi.ReceivedTime
+        If DateValue(mi.ReceivedTime) = firstDayofMonth Or DateValue(mi.ReceivedTime) = dtFirstBusinessDay Then
+            If mi.Subject = ws.Cells(currentRow, titleCol) & " - " & Format(previousMonth, "mmmm yyyy") Then
+                'If I want to detect emails separately, then this may require an additional check on email body'
+                'And also, specify a row to put down the key values, increase the row number when find the next mail item'
+
+                For Each Atmt In mi.Attachments
+                    If Right(Atmt.Filename, 4) = ".xls" Or Right(Atmt.Filename, 5) = ".xlsx" Or Right(Atmt.Filename, 4) = ".pdf" Then
+                        On Error Resume Next
+                        ws.Cells(currentRow, namesCol).Value = Atmt.Filename
+                        attachmentCount = attachmentCount + 1
+                        namesCol = namesCol + 1
+                        If Err.Number <> 0 Then
+                            MsgBox "Error" & Err.Description
+                        End If
+                        'File name problem'
+                        If InStr(1, Atmt.Filename, "TPGP", vbTextCompare) > 0 Then
+                        ' Save the attachment with a specific name
+                            saveName = "TPGP - FV.xlsx"
+                        Else
+                        ' Save the attachment with its original name
+                            saveName = Atmt.Filename
+                    End If
+                        Atmt.SaveAsFile dropFolder & Atmt.Filename
+                        Atmt.SaveAsFile H_SaveFolder & saveName
+                        'Debug.Print Atmt.Filename
+                        'Debug.Print dropFolder
+                    End If
+                Next Atmt
+                ws.Cells(currentRow, fileCountCol).Value = attachmentCount
+                'I want to exit earlier once the qualified email is found, so no need to loop through all the emails'
+                'Else: Exit For
+            End If
+
+        End If
+    Next mi
+            
+            
+    endTime = Now
+    processTime = DateDiff("s", startTime, endTime)
+    
+    MsgBox "Done, Process time: " & processTime & "seconds"
+      
+    ' Clean up
+    Set attachment = Nothing
+    Set mi = Nothing
+    Set inboxFolder = Nothing
+    Set outlookNamespace = Nothing
+    Set outlookApp = Nothing
+    Set Worksheet = Nothing
+    Set Workbook = Nothing
+    Set excelApp = Nothing
+
+End Sub
