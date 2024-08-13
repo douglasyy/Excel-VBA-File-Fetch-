@@ -1,0 +1,327 @@
+import numpy as np
+import pandas as pd
+import dask.dataframe as dd
+import datetime
+import dask.array as da
+import dask.bag as db
+import pytz
+import os
+import win32com.client as win32
+from pandas.tseries.holiday import USFederalHolidayCalendar
+from collections import defaultdict
+from collections import Counter
+# import seaborn as sns
+# import matplotlib as mp
+import cProfile
+
+def compress_data(parquet_path, file_dtypes):
+    history = pd.read_csv(parquet_path + 'Archival Records/deposit 2023.csv', chunksize=200000, low_memory=False, keep_default_na=False)
+    print('data compiled')
+
+    # Loop through chunks and place in a list to minimize memory need
+    df_list = []
+    for df in history:
+        df = df.astype(file_dtypes)
+        df_list.append(df)
+
+    # Concatenate list of dataframes into one, then reduce to smaller memory usage dtypes #TODO axis= 0 in concat to stack?
+    history2 = pd.concat(df_list, ignore_index=True)
+    history2 = history2.astype(file_dtypes)
+
+    # Drop unnecessary columns
+    history2 = history2.drop(drop_list, axis=1)
+
+    # Convert dtypes to smaller memory usage types
+    # history2 = history2.convert_dtypes()
+    # print('initial data aggregated and types assigned')
+
+    # history2.to_parquet(path='H:/FR 2052a/Automation/Databases/Test/Deposits.parquet.gzip', engine='pyarrow', compression='gzip')
+
+    # Convert to dask dataframe
+    final = dd.from_pandas(history2, chunksize=100000)
+    print('data converted to Dask')
+
+    final.to_parquet(path='H:/FR 2052a/Automation/Databases/Deposit History Database/Reformatted/', engine='pyarrow', compression='brotli', append='True',
+                              name_function=lambda i: f'2024 Deposit Data.{i}.parquet', ignore_divisions=True, write_metadata_file=False)
+    print('data compressed')
+    return
+
+
+def extract_deposit_email(parquet_path):
+    # Open outlook and locate folder containing reports
+    current_day_dash = '01-02-2024'
+    outlook = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    inbox = outlook.GetDefaultFolder(6)
+    reports = inbox.Folders.item("Daily Reporting")
+    messages = reports.Items
+    # messages = messages.Restrict("[ReceivedTime] >= '" + current_day_dash + "'")
+    messages = messages.Restrict("[ReceivedTime] >= '" + current_day_dash + "' AND [Subject] = 'Report: Treasury Deposit Model Data'")
+
+    for message in messages:
+        received = str(message.ReceivedTime.month) + '-' + str(message.ReceivedTime.day) + '-' + str(message.ReceivedTime.year)
+        if message.Subject == 'Report: Treasury Deposit Model Data':
+            for attachment in message.Attachments:
+                attachment.SaveAsFile(os.path.join(parquet_path + 'Deposit Files/', f'Treasury Deposit Model Data {received}.xlsx'))
+    return
+
+def process_excel_files():
+    names = []
+    for dir_path, dir_names, file_names in os.walk('H:/FR 2052a/Automation/Databases/Deposit Files/'):
+        names.extend(file_names)
+
+    deposit_df = {}
+    for i in names:
+        print(f'reading {i}')
+        df = pd.read_excel('H:/FR 2052a/Automation/Databases/Deposit Files/' + i, dtype=file_dtypes)
+        df = df.drop(drop_list, axis=1)
+        deposit_df[i] = df
+    print('Combining dataframes')
+    combined = pd.concat(deposit_df.values(), ignore_index=True)
+    final = dd.from_pandas(combined, npartitions=1)
+    # print('Exporting combined dataframe to csv')
+    # combined.to_csv(parquet_path + 'deposit 2024.csv', index=False, mode='a')
+    print('Exporting combined dataframe to parquet')
+    final.to_parquet(path='H:/FR 2052a/Automation/Databases/Archival Records/2024 Deposit History/', engine='pyarrow', compression='brotli', append='True',
+                              name_function=lambda i: f'2024 Deposit Data.{i}.parquet', ignore_divisions=True, write_metadata_file=False)
+    return
+
+
+def deposit_schema(ddf, date_string):
+    # Lists of columns assignments
+    all_other_dimensions = ['Deposit Account Number', 'Account NAICS', 'Client LOB', 'Client Type', 'Dep Instr Current Int Rate', 'Dep Instr Int Plan No.', 'Dep Open Date',
+                            'Dep Pass Through Insurance Indicator', 'Dep Profit Center No.', 'Dep Special Classification Code', 'Deposit Category Code', 'Deposit GL Account',
+                            'Deposit Type Code']
+    fact_cols = ['Deposit Account Number', 'Deposit Ledger Balance', 'Date', 'Dep Instr Current Int Rate', 'Dep Next Maturity Date TD']
+
+    # conditionally drop duplicates, e.g. drop duplicates of a specific value,
+    # new_df = df[~df['Id'].duplicated() | df['Id'].ne('a1')].copy()
+
+    # Create a Fact table conditionally dropping duplicates
+    # fact_table = ddf[fact_cols]
+    # fact_table.repartition(npartitions=1).to_parquet(path='H:/FR 2052a/Automation/Databases/Deposit Schema Tables/NEW Fact/', engine='pyarrow', compression='gzip', append='True',
+    #                           name_function=lambda i: f'Deposit History Fact {date_string}.{i}.parquet', ignore_divisions=True, write_metadata_file=False)
+
+    # Create datasets of dimension attributes filtered by unique account numbers
+    print('relationship attributes')
+    relationship = pd.read_parquet('H:/FR 2052a/Automation/Databases/Deposit Schema Tables/Dimension/Relationship/Combined/')
+    current_relationship = ddf[['Relationship Number', 'Relationship Name', 'Deposit Account Number', 'Client Name']].compute()
+    relationship = pd.concat([relationship, current_relationship])
+    relationship.drop_duplicates(subset='Deposit Account Number', keep='last', inplace=True, ignore_index=True)
+    relationship = relationship.astype({'Relationship Number': 'int64',
+                                        'Relationship Name': 'str',
+                                        'Deposit Account Number': 'int64',
+                                        'Client Name': 'str'})
+    relationship.to_parquet('H:/FR 2052a/Automation/Databases/Deposit Schema Tables/Dimension/Relationship/Combined/Relationship.0.parquet', engine='pyarrow', compression='brotli')
+
+    # Store unique deposit type information
+    # print('type attributes')
+    # deposit_type = pd.read_excel('H:/FR 2052a/Automation/Databases/Deposit Schema Tables/Dimension/Type/')
+    # current_type = ddf[['Deposit Type Code', 'Deposit Type Description']].compute()
+    # deposit_type = pd.concat([deposit_type, current_type])
+    # deposit_type = deposit_type.drop_duplicates(subset='Deposit Type Code', inplace=True, ignore_index=True)
+    # deposit_type.to_excel('H:/FR 2052a/Automation/Databases/Deposit Schema Tables/Dimension/Type/Deposit Type Codes.xlsx', index=False)
+
+    # Store all other unique attributes
+    print('other attributes')
+    all_other = pd.read_parquet('H:/FR 2052a/Automation/Databases/Deposit Schema Tables/Dimension/All Other/Combined/')
+    current_all_other = ddf[all_other_dimensions].compute()
+    all_other = pd.concat([all_other, current_all_other])
+    all_other.drop_duplicates(subset='Deposit Account Number', inplace=True, ignore_index=True)
+    all_other = all_other.astype({'Deposit Account Number': 'int64', 'Account NAICS': 'int64', 'Dep Profit Center No.': 'int64'})
+    all_other.to_parquet(path='H:/FR 2052a/Automation/Databases/Deposit Schema Tables/Dimension/All Other/Combined/Deposit All Other.0.parquet',
+                         engine='pyarrow', compression='brotli')
+    return
+
+def groupby_relationship(file_path):
+    history = dd.read_parquet(file_path, columns=['Relationship Number', 'Deposit Account Number', 'Date', 'Deposit Ledger Balance'])
+    history['Daily Change'] = 0.0
+    history = history.compute()
+    history.reset_index(inplace=True)
+    print('Data read into memory')
+
+    # Prepare aggregation variables for indexing and calculating balance
+    latest_accounts = np.array(history[history['Date'] == max(np.array(history['Date']))]['Deposit Account Number'])
+    account_num = np.unique(history['Deposit Account Number'])
+    closed_accts = [a for a in account_num if a not in latest_accounts]
+    account_list = np.array(history['Deposit Account Number'])
+    balance_list = np.array(history['Deposit Ledger Balance'])
+    total_accts = len(account_num)
+
+    index_list = []
+    for n in account_list:
+        index_list.append([])
+
+    # Create dictionary of empty lists
+    account_ranges_dict = dict(zip(account_list, index_list))
+
+    # Populate empty lists with index locations for each distinct account number
+    for ind, ele in enumerate(account_list):
+        account_ranges_dict.get(ele).append(ind)
+    print('Variables, dictionaries and lists prepared')
+
+    # Loop through each unique account and calculate daily change amount by product using precise account level index locations
+    for ind, account in enumerate(account_num):
+        # print(f'processing account {ind + 1} of {total_accts}')
+        index_range = account_ranges_dict[account]
+        if account in closed_accts:
+            try:
+                change = np.diff(balance_list[index_range], 1)
+                change[-1] = -balance_list[index_range][-1]
+                change = np.insert(change, 0, 0)
+            except IndexError:
+                change = np.array(0, 'float64')
+        else:
+            change = np.diff(balance_list[index_range], 1)
+            change = np.insert(change, 0, 0)
+        history.loc[index_range, 'Daily Change'] = change
+    print("Change amounts calculated")
+
+    print('Grouping by relationship')
+    aggregate = {**{col: 'first' for col in history.select_dtypes(include=object).columns},
+                 **{col: 'first' for col in history.select_dtypes(include=[np.datetime64]).columns},
+                 **{col: 'sum' for col in history.select_dtypes(include=float).columns}}
+
+    grouped = history.groupby(['Relationship Number', 'Deposit Account Number', 'Date']).agg(aggregate)
+    print('Deposit data grouped')
+
+    grouped.to_parquet(path='H:/FR 2052a/Automation/Databases/Deposit Schema Tables/Calculated Tables/Deposit Relationship Totals.parquet', engine='pyarrow', compression='brotli')
+    print('Relationship totals exported')
+    return
+
+
+def groupby_relationship_daily(dask_df, date_string):
+    current = dask_df[['Relationship Number', 'Deposit Account Number', 'Date', 'Deposit Ledger Balance']]
+    current['Daily Change'] = 0.0
+    current = current.compute()
+
+    # Formatted current date and current date datetime object
+    todays_date = datetime.datetime(year=int(date_string[0:4]), month=int(date_string[4:6]), day=int(date_string[6:8]), tzinfo=pytz.utc)
+
+    # Manual prior day time series if CIBC does not observe a Federal Holiday (floating holiday)
+    prior_bd = pd.Timestamp(todays_date) + pd.tseries.offsets.CustomBusinessDay(n=-1, calendar=USFederalHolidayCalendar())
+    prior_bd2 = pd.Timestamp(todays_date) + pd.tseries.offsets.CustomBusinessDay(n=-2, calendar=USFederalHolidayCalendar())
+    # prior_bd = pd.Timestamp(todays_date) + pd.tseries.offsets.CustomBusinessDay(n=-1)
+    prior_bd_str = datetime.datetime.strftime(prior_bd, "%Y%m%d")
+    prior_bd_str2 = datetime.datetime.strftime(prior_bd2, "%Y%m%d")
+
+    # Create list of files in deposit archival folder
+    deposit_files = []
+    for dir_path, dir_names, file_names in os.walk('H:/FR 2052a/Automation/Databases/Deposits/'):
+        deposit_files.extend(file_names)
+
+    # Get the name of the latest deposit archive file
+    prior_day_file = [x for x in deposit_files if prior_bd_str in x or prior_bd_str2 in x]
+    prior = pd.read_parquet(f'H:/FR 2052a/Automation/Databases/Deposits/{prior_day_file[0]}',
+                            columns=['Relationship Number', 'Deposit Account Number', 'Deposit Type Code', 'Date', 'Deposit Ledger Balance'])
+
+    # Combine current and previous files
+    history = pd.concat([prior, current])
+    history.reset_index(inplace=True)
+    print('Data read into memory')
+
+    print('Preparing variables...')
+    # Compare current and prior day accounts to determine which are closed and which are new
+    prior_day_accounts = np.unique(prior['Deposit Account Number'])
+    current_day_accounts = np.unique(current['Deposit Account Number'])
+    closed_accts = [a for a in prior_day_accounts if a not in current_day_accounts]
+    new_accts = [a for a in current_day_accounts if a not in prior_day_accounts]
+
+    # Prepare aggregation variables for indexing and calculating balance
+    account_num = np.unique(history['Deposit Account Number'])
+    account_list = np.array(history['Deposit Account Number'])
+    balance_list = np.array(history['Deposit Ledger Balance'])
+    total_accts = len(account_num)
+
+    index_list = []
+    for n in account_list:
+        index_list.append([])
+
+    # Create dictionary of empty lists
+    account_ranges_dict = dict(zip(account_list, index_list))
+
+    # Populate empty lists with index locations for each distinct account number
+    for ind, ele in enumerate(account_list):
+        account_ranges_dict.get(ele).append(ind)
+    print('Variables, dictionaries and lists prepared')
+
+    # Loop through each unique account and calculate daily change amount by product using precise account level index locations
+    for ind, account in enumerate(account_num):
+        index_range = account_ranges_dict[account]
+        # print(f'processing account {ind + 1} of {total_accts}')
+        if account in closed_accts:
+            change = -np.array(balance_list[index_range])
+        elif account in new_accts:
+            change = np.array(balance_list[index_range])
+        else:
+            change = np.diff(balance_list[index_range], 1)
+            change = np.insert(change, 0, 0)
+        history.loc[index_range, 'Daily Change'] = change
+    print("Change amounts calculated")
+
+    print('Grouping by relationship')
+    aggregate = {**{col: 'first' for col in history.select_dtypes(include=object).columns},
+                 **{col: 'first' for col in history.select_dtypes(include=[np.datetime64]).columns},
+                 **{col: 'sum' for col in history.select_dtypes(include=float).columns}}
+
+    grouped = history.groupby(['Relationship Number', 'Deposit Account Number', 'Date']).agg(aggregate)
+    print('Deposit data grouped')
+
+    current_change = grouped[grouped['Date'] == pd.Timestamp(todays_date).strftime('%Y-%m-%d')]
+
+    current_change.to_parquet(path=f'H:/FR 2052a/Automation/Databases/Deposit Schema Tables/Calculated Tables/Deposit Relationship Totals {date_string}.parquet', engine='pyarrow', compression='brotli')
+    print('Relationship totals exported')
+    return
+
+
+def fix_account_number(df):
+
+    accounts = df['Deposit Account Number'].tolist()
+
+    # Loop through accounts and convert to simple whole number format, stripping leading zeros and trailing values
+    for n, acc in enumerate(accounts):
+        if "-" in acc and 'ICS' not in acc:
+            accounts[n] = int(acc[:11].lstrip("0"))
+        elif 'ICS' in accounts[n]:
+            accounts[n] = int(acc.replace("-ICS", "99").lstrip("0"))
+        else:
+            accounts[n] = int(acc)
+
+    # Replace original values in the dataframe and change the column types to integer
+    df['Deposit Account Number'] = accounts
+
+    cdw_report_cols = np.array(['Relationship Number', 'Deposit Account Number', 'Account NAICS', 'Dep Profit Center No.'])
+    if np.isin(cdw_report_cols, df.columns.values).all():
+        df = df.astype({'Relationship Number': 'int64', 'Deposit Account Number': 'int64', 'Account NAICS': 'int64', 'Dep Profit Center No.': 'int64'})
+    else:
+        df = df.astype({'Deposit Account Number': 'int64'})
+
+    return df
+
+
+if __name__ == '__main__':
+    parquet_path = 'H:/FR 2052a/Automation/Databases/'
+    start_date = '2024-01-01'
+    end_date = '2024-12-31'
+
+    drop_list = ['Account Banker Name', 'Prior Quarter Ledger Balance', 'Prior Fiscal Quarter Ledger Bal']
+
+    # Specify data types from an input source in order to allow for faster data processing and proper parquet appending
+    assign_type = pd.read_excel(parquet_path + 'Data File Dtypes/Deposits.xlsx')
+    type_kev = assign_type['Column'].tolist()
+    type_val = assign_type['Type'].tolist()
+    file_dtypes = dict(zip(type_kev, type_val))
+    file_dtypes.update({'Prior Bus Day Ledger Balance': 'str'})
+
+    # Drop items from dictionary
+    for item in drop_list:
+        file_dtypes.pop(item)
+
+    # extract_deposit_email()
+    # compress_data(parquet_path, file_dtypes)
+    # deposit_schema('2024 Deposit History.4.parquet', '20240315')
+    # groupby_relationship('H:/FR 2052a/Automation/Databases/Deposit History Database/')
+    # fix_account_number(parquet_path + 'Deposits/Deposits - 20240319.5.parquet')
+    print('main')
+
+
+
